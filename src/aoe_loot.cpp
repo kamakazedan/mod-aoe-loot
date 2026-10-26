@@ -431,6 +431,352 @@ namespace
         for (size_t i = 0; i < loot->items.size(); ++i)
             loot->items[i].itemIndex = static_cast<uint32>(i);
     }
+
+    // Pull the loot `player` may take from the corpses around `mainCreature`
+    // into its loot, so one window shows it all. With `questItems`, quest
+    // items they still need go straight into their bags. Anything that cannot
+    // move stays on its own corpse.
+    void MergeNearbyLoot(Player* player, Creature* mainCreature, bool questItems)
+    {
+        ObjectGuid const targetGuid = mainCreature->GetGUID();
+
+        // Get configured loot range
+        float range = sConfigMgr->GetOption<float>("AOELoot.Range", 55.0f);
+
+        // Limit range to reasonable values
+        if (range < 5.0f)
+            range = 5.0f;
+
+        if (range > 100.0f)
+            range = 100.0f;
+
+        // Get nearby corpses
+        std::list<Creature*> nearbyCorpses;
+        player->GetDeadCreatureListInGrid(nearbyCorpses, range);
+
+        // Remove invalid corpses and main target
+        nearbyCorpses.remove_if([&](Creature* c)
+            {
+                return !c ||
+                    c->GetGUID() == targetGuid ||
+                    !c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) ||
+                    c->loot.loot_type == LOOT_SKINNING ||
+                    HasPendingRoll(c->loot) ||
+                    !player->isAllowedToLoot(c);
+            });
+
+        // No other corpses: nothing to pull in
+        if (nearbyCorpses.empty())
+            return;
+
+        // Get main loot
+        Loot* mainLoot = &mainCreature->loot;
+
+        // Track total gold to merge
+        uint32 totalGold = mainLoot->gold;
+
+        struct RegularLootCandidate
+        {
+            Creature* sourceCreature;
+            size_t sourceIndex;
+            LootItem item;
+        };
+
+        struct QuestLootCandidate
+        {
+            Creature* sourceCreature;
+            size_t sourceIndex;
+            LootItem item;
+        };
+
+        std::vector<Creature*> processedCreatures;
+        std::vector<RegularLootCandidate> regularCandidates;
+        std::vector<QuestLootCandidate> questCandidates;
+
+        for (Creature* creature : nearbyCorpses)
+        {
+
+            if (!creature)
+                continue;
+
+            Loot* loot = &creature->loot;
+
+            // Skip already looted corpses.
+            if (loot->isLooted())
+                continue;
+
+            processedCreatures.push_back(creature);
+
+            // Gold does not consume a loot-window row.
+            if (loot->gold > 0)
+            {
+                if (loot->gold <=
+                    std::numeric_limits<uint32>::max() - totalGold)
+                {
+                    totalGold += loot->gold;
+                    loot->gold = 0;
+                }
+            }
+
+            // Collect safe regular items as candidates. Do not remove
+            // anything from the source corpse yet.
+            for (size_t i = 0; i < loot->items.size(); ++i)
+            {
+                LootItem const& item = loot->items[i];
+
+                if (!CanSafelySortLootItem(item))
+                    continue;
+
+                // The row ends up on the clicked corpse.
+                if (!item.AllowedForPlayer(
+                        player, mainLoot->sourceWorldObjectGUID))
+                {
+                    continue;
+                }
+
+                if (IsReservedByGroupLootRules(player, *loot, item) ||
+                    IsReservedByGroupLootRules(player, *mainLoot, item))
+                {
+                    continue;
+                }
+
+                regularCandidates.push_back(
+                    { creature, i, item });
+            }
+
+            // Collect safe quest items needed by the player.
+            for (size_t i = 0; questItems && i < loot->quest_items.size(); ++i)
+            {
+                LootItem const& questItem = loot->quest_items[i];
+
+                if (!player->HasQuestForItem(questItem.itemid))
+                    continue;
+
+                // Special group/free-for-all quest items remain on their
+                // source corpse so we don't damage ownership information.
+                if (questItem.freeforall ||
+                    questItem.is_blocked ||
+                    questItem.follow_loot_rules ||
+                    !questItem.conditions.empty() ||
+                    questItem.rollWinnerGUID)
+                {
+                    continue;
+                }
+
+                // Quest rows are only filled for looters present at the kill.
+                if (!questItem.AllowedForPlayer(
+                        player, loot->sourceWorldObjectGUID) ||
+                    !questItem.GetAllowedLooters().count(player->GetGUID()))
+                {
+                    continue;
+                }
+
+                uint32 maxNeeded = 0;
+
+                for (uint8 slot = 0;
+                     slot < MAX_QUEST_LOG_SIZE;
+                     ++slot)
+                {
+                    uint32 questId =
+                        player->GetQuestSlotQuestId(slot);
+
+                    if (!questId)
+                        continue;
+
+                    Quest const* quest =
+                        sObjectMgr->GetQuestTemplate(questId);
+
+                    if (!quest)
+                        continue;
+
+                    for (uint8 j = 0;
+                         j < QUEST_ITEM_OBJECTIVES_COUNT;
+                         ++j)
+                    {
+                        if (quest->RequiredItemId[j] ==
+                                questItem.itemid &&
+                            quest->RequiredItemCount[j] >
+                                maxNeeded)
+                        {
+                            maxNeeded =
+                                quest->RequiredItemCount[j];
+                        }
+                    }
+                }
+
+                if (maxNeeded == 0)
+                    continue;
+
+                uint32 ownedCount =
+                    player->GetItemCount(questItem.itemid, true);
+
+                for (QuestLootCandidate const& pending :
+                     questCandidates)
+                {
+                    if (pending.item.itemid == questItem.itemid)
+                        ownedCount += pending.item.count;
+                }
+
+                for (LootItem const& mainQuestItem :
+                     mainLoot->quest_items)
+                {
+                    if (mainQuestItem.itemid == questItem.itemid)
+                        ownedCount += mainQuestItem.count;
+                }
+
+                if (ownedCount >= maxNeeded)
+                    continue;
+
+                uint32 stillNeeded = maxNeeded - ownedCount;
+
+                LootItem cappedItem = questItem;
+                cappedItem.count = std::min(
+                    static_cast<uint32>(questItem.count),
+                    stillNeeded);
+
+                questCandidates.push_back(
+                    { creature, i, cappedItem });
+            }
+        }
+
+        // Prioritize every regular candidate before consuming rows.
+        std::stable_sort(
+            regularCandidates.begin(),
+            regularCandidates.end(),
+            [](RegularLootCandidate const& left,
+               RegularLootCandidate const& right)
+            {
+                return GetLootSortPriority(left.item) <
+                    GetLootSortPriority(right.item);
+            });
+
+        // Quest rows already belonging to the selected corpse still
+        // occupy client loot-window capacity.
+        size_t reservedQuestRows =
+            mainLoot->quest_items.size();
+
+        // Transfer regular candidates in priority order.
+        for (RegularLootCandidate const& candidate :
+             regularCandidates)
+        {
+            Loot* sourceLoot =
+                &candidate.sourceCreature->loot;
+
+            if (candidate.sourceIndex >=
+                sourceLoot->items.size())
+            {
+                continue;
+            }
+
+            LootItem& sourceItem =
+                sourceLoot->items[candidate.sourceIndex];
+
+            if (sourceItem.is_looted)
+                continue;
+
+            uint32 sourceCount = sourceItem.count;
+
+            uint32 transferred = AddOrStackRegularLoot(
+                mainLoot,
+                sourceItem,
+                reservedQuestRows);
+
+            // Nothing fit. Leave the complete item on its corpse.
+            if (transferred == 0)
+                continue;
+
+            if (transferred >= sourceCount)
+            {
+                // The complete source row was transferred.
+                sourceItem.is_looted = true;
+
+                if (sourceLoot->unlootedCount > 0)
+                    --sourceLoot->unlootedCount;
+            }
+            else
+            {
+                // Only part of the stack fitted. Preserve the remainder.
+                sourceItem.count = static_cast<uint8>(
+                    sourceCount - transferred);
+            }
+        }
+
+        // Add safe quest items directly to inventory. Their source rows
+        // are changed only after AddItem reports success.
+        for (QuestLootCandidate const& candidate :
+             questCandidates)
+        {
+            if (!player->HasQuestForItem(
+                    candidate.item.itemid))
+            {
+                continue;
+            }
+
+            Loot* sourceLoot =
+                &candidate.sourceCreature->loot;
+
+            if (candidate.sourceIndex >=
+                sourceLoot->quest_items.size())
+            {
+                continue;
+            }
+
+            LootItem& sourceItem =
+                sourceLoot->quest_items[
+                    candidate.sourceIndex];
+
+            if (sourceItem.is_looted)
+                continue;
+
+            uint32 amountToAdd = std::min<uint32>(
+                candidate.item.count,
+                sourceItem.count);
+
+            if (amountToAdd == 0 ||
+                !player->AddItem(
+                    sourceItem.itemid,
+                    amountToAdd))
+            {
+                continue;
+            }
+
+            if (amountToAdd >= sourceItem.count)
+            {
+                sourceItem.is_looted = true;
+
+                if (sourceLoot->unlootedCount > 0)
+                    --sourceLoot->unlootedCount;
+            }
+            else
+            {
+                sourceItem.count = static_cast<uint8>(
+                    sourceItem.count - amountToAdd);
+            }
+        }
+
+        // Apply all successfully collected gold to the selected corpse.
+        mainLoot->gold = totalGold;
+
+        // Remove only rows that were successfully transferred.
+        // Rejected overflow rows remain on their source corpses.
+        for (Creature* creature : processedCreatures)
+        {
+            Loot* loot = &creature->loot;
+
+            CompactTransferredRegularLoot(loot);
+
+            if (!loot->isLooted())
+                continue;
+
+            creature->AllLootRemovedFromCorpse();
+            creature->RemoveDynamicFlag(
+                UNIT_DYNFLAG_LOOTABLE);
+            loot->clear();
+        }
+
+        // Organize regular loot before sending the window.
+        SortRegularLoot(mainLoot);
+    }
 }
 
 void AOELootPlayer::OnPlayerLogin(Player* player)
@@ -441,6 +787,34 @@ void AOELootPlayer::OnPlayerLogin(Player* player)
     if (sConfigMgr->GetOption<bool>("AOELoot.Enable", true) && sConfigMgr->GetOption<bool>("AOELoot.Message", true))
         if (WorldSession* session = player->GetSession())
             ChatHandler(session).PSendModuleSysMessage(MODULE_STRING, AOE_LOGIN_MESSAGE);
+}
+
+void AOELootPlayer::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot)
+{
+    if (!player || !loot || !lootGuid.IsCreatureOrVehicle() || loot->loot_type != LOOT_CORPSE)
+        return;
+
+    // Real players are merged in CanPacketReceive, before the window is sent.
+    // Only a session without a client -- a bot -- is handled here.
+    WorldSession* session = player->GetSession();
+    if (!session || !session->IsSocketClosed())
+        return;
+
+    if (!sConfigMgr->GetOption<bool>("AOELoot.Enable", true) ||
+        !sConfigMgr->GetOption<bool>("AOELoot.Bots", true))
+        return;
+
+    if (player->GetGroup() && !sConfigMgr->GetOption<bool>("AOELoot.Group", true))
+        return;
+
+    Creature* mainCreature = player->GetMap()->GetCreature(lootGuid);
+    if (!mainCreature || &mainCreature->loot != loot ||
+        !mainCreature->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) || HasPendingRoll(mainCreature->loot))
+        return;
+
+    // Bots take regular loot only: quest items are theirs to loot, or not,
+    // the way playerbots decides.
+    MergeNearbyLoot(player, mainCreature, false);
 }
 
 void AOELootWorld::OnAfterConfigLoad(bool /*reload*/)
@@ -491,16 +865,6 @@ bool AOELootServer::CanPacketReceive(WorldSession* session, WorldPacket const& p
     if (player->GetGroup() && !sConfigMgr->GetOption<bool>("AOELoot.Group", true))
         return true;
 
-    // Get configured loot range
-    float range = sConfigMgr->GetOption<float>("AOELoot.Range", 55.0f);
-
-    // Limit range to reasonable values
-    if (range < 5.0f)
-        range = 5.0f;
-
-    if (range > 100.0f)
-        range = 100.0f;
-
     // Read target GUID from packet
     WorldPacket packetCopy(packet);
     ObjectGuid targetGuid;
@@ -521,338 +885,8 @@ bool AOELootServer::CanPacketReceive(WorldSession* session, WorldPacket const& p
     if (HasPendingRoll(mainCreature->loot))
         return true;
 
-    // Get nearby corpses
-    std::list<Creature*> nearbyCorpses;
-    player->GetDeadCreatureListInGrid(nearbyCorpses, range);
-
-    // Remove invalid corpses and main target
-    nearbyCorpses.remove_if([&](Creature* c)
-        {
-            return !c ||
-                c->GetGUID() == targetGuid ||
-                !c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) ||
-                c->loot.loot_type == LOOT_SKINNING ||
-                HasPendingRoll(c->loot) ||
-                !player->isAllowedToLoot(c);
-        });
-
-    // If no other corpses, process normally
-    if (nearbyCorpses.empty())
-    {
-        player->SendLoot(targetGuid, LOOT_CORPSE);
-        TrackAoeLootWindow(player, targetGuid);
-        return false;
-    }
-
-    // Get main loot
-    Loot* mainLoot = &mainCreature->loot;
-
-    // Track total gold to merge
-    uint32 totalGold = mainLoot->gold;
-
-    struct RegularLootCandidate
-    {
-        Creature* sourceCreature;
-        size_t sourceIndex;
-        LootItem item;
-    };
-
-    struct QuestLootCandidate
-    {
-        Creature* sourceCreature;
-        size_t sourceIndex;
-        LootItem item;
-    };
-
-    std::vector<Creature*> processedCreatures;
-    std::vector<RegularLootCandidate> regularCandidates;
-    std::vector<QuestLootCandidate> questCandidates;
-
-    for (Creature* creature : nearbyCorpses)
-    {
-
-        if (!creature)
-            continue;
-
-        Loot* loot = &creature->loot;
-
-        // Skip already looted corpses.
-        if (loot->isLooted())
-            continue;
-
-        processedCreatures.push_back(creature);
-
-        // Gold does not consume a loot-window row.
-        if (loot->gold > 0)
-        {
-            if (loot->gold <=
-                std::numeric_limits<uint32>::max() - totalGold)
-            {
-                totalGold += loot->gold;
-                loot->gold = 0;
-            }
-        }
-
-        // Collect safe regular items as candidates. Do not remove
-        // anything from the source corpse yet.
-        for (size_t i = 0; i < loot->items.size(); ++i)
-        {
-            LootItem const& item = loot->items[i];
-
-            if (!CanSafelySortLootItem(item))
-                continue;
-
-            // The row ends up on the clicked corpse.
-            if (!item.AllowedForPlayer(
-                    player, mainLoot->sourceWorldObjectGUID))
-            {
-                continue;
-            }
-
-            if (IsReservedByGroupLootRules(player, *loot, item) ||
-                IsReservedByGroupLootRules(player, *mainLoot, item))
-            {
-                continue;
-            }
-
-            regularCandidates.push_back(
-                { creature, i, item });
-        }
-
-        // Collect safe quest items needed by the player.
-        for (size_t i = 0; i < loot->quest_items.size(); ++i)
-        {
-            LootItem const& questItem = loot->quest_items[i];
-
-            if (!player->HasQuestForItem(questItem.itemid))
-                continue;
-
-            // Special group/free-for-all quest items remain on their
-            // source corpse so we don't damage ownership information.
-            if (questItem.freeforall ||
-                questItem.is_blocked ||
-                questItem.follow_loot_rules ||
-                !questItem.conditions.empty() ||
-                questItem.rollWinnerGUID)
-            {
-                continue;
-            }
-
-            // Quest rows are only filled for looters present at the kill.
-            if (!questItem.AllowedForPlayer(
-                    player, loot->sourceWorldObjectGUID) ||
-                !questItem.GetAllowedLooters().count(player->GetGUID()))
-            {
-                continue;
-            }
-
-            uint32 maxNeeded = 0;
-
-            for (uint8 slot = 0;
-                 slot < MAX_QUEST_LOG_SIZE;
-                 ++slot)
-            {
-                uint32 questId =
-                    player->GetQuestSlotQuestId(slot);
-
-                if (!questId)
-                    continue;
-
-                Quest const* quest =
-                    sObjectMgr->GetQuestTemplate(questId);
-
-                if (!quest)
-                    continue;
-
-                for (uint8 j = 0;
-                     j < QUEST_ITEM_OBJECTIVES_COUNT;
-                     ++j)
-                {
-                    if (quest->RequiredItemId[j] ==
-                            questItem.itemid &&
-                        quest->RequiredItemCount[j] >
-                            maxNeeded)
-                    {
-                        maxNeeded =
-                            quest->RequiredItemCount[j];
-                    }
-                }
-            }
-
-            if (maxNeeded == 0)
-                continue;
-
-            uint32 ownedCount =
-                player->GetItemCount(questItem.itemid, true);
-
-            for (QuestLootCandidate const& pending :
-                 questCandidates)
-            {
-                if (pending.item.itemid == questItem.itemid)
-                    ownedCount += pending.item.count;
-            }
-
-            for (LootItem const& mainQuestItem :
-                 mainLoot->quest_items)
-            {
-                if (mainQuestItem.itemid == questItem.itemid)
-                    ownedCount += mainQuestItem.count;
-            }
-
-            if (ownedCount >= maxNeeded)
-                continue;
-
-            uint32 stillNeeded = maxNeeded - ownedCount;
-
-            LootItem cappedItem = questItem;
-            cappedItem.count = std::min(
-                static_cast<uint32>(questItem.count),
-                stillNeeded);
-
-            questCandidates.push_back(
-                { creature, i, cappedItem });
-        }
-    }
-
-    // Prioritize every regular candidate before consuming rows.
-    std::stable_sort(
-        regularCandidates.begin(),
-        regularCandidates.end(),
-        [](RegularLootCandidate const& left,
-           RegularLootCandidate const& right)
-        {
-            return GetLootSortPriority(left.item) <
-                GetLootSortPriority(right.item);
-        });
-
-    // Quest rows already belonging to the selected corpse still
-    // occupy client loot-window capacity.
-    size_t reservedQuestRows =
-        mainLoot->quest_items.size();
-
-    // Transfer regular candidates in priority order.
-    for (RegularLootCandidate const& candidate :
-         regularCandidates)
-    {
-        Loot* sourceLoot =
-            &candidate.sourceCreature->loot;
-
-        if (candidate.sourceIndex >=
-            sourceLoot->items.size())
-        {
-            continue;
-        }
-
-        LootItem& sourceItem =
-            sourceLoot->items[candidate.sourceIndex];
-
-        if (sourceItem.is_looted)
-            continue;
-
-        uint32 sourceCount = sourceItem.count;
-
-        uint32 transferred = AddOrStackRegularLoot(
-            mainLoot,
-            sourceItem,
-            reservedQuestRows);
-
-        // Nothing fit. Leave the complete item on its corpse.
-        if (transferred == 0)
-            continue;
-
-        if (transferred >= sourceCount)
-        {
-            // The complete source row was transferred.
-            sourceItem.is_looted = true;
-
-            if (sourceLoot->unlootedCount > 0)
-                --sourceLoot->unlootedCount;
-        }
-        else
-        {
-            // Only part of the stack fitted. Preserve the remainder.
-            sourceItem.count = static_cast<uint8>(
-                sourceCount - transferred);
-        }
-    }
-
-    // Add safe quest items directly to inventory. Their source rows
-    // are changed only after AddItem reports success.
-    for (QuestLootCandidate const& candidate :
-         questCandidates)
-    {
-        if (!player->HasQuestForItem(
-                candidate.item.itemid))
-        {
-            continue;
-        }
-
-        Loot* sourceLoot =
-            &candidate.sourceCreature->loot;
-
-        if (candidate.sourceIndex >=
-            sourceLoot->quest_items.size())
-        {
-            continue;
-        }
-
-        LootItem& sourceItem =
-            sourceLoot->quest_items[
-                candidate.sourceIndex];
-
-        if (sourceItem.is_looted)
-            continue;
-
-        uint32 amountToAdd = std::min<uint32>(
-            candidate.item.count,
-            sourceItem.count);
-
-        if (amountToAdd == 0 ||
-            !player->AddItem(
-                sourceItem.itemid,
-                amountToAdd))
-        {
-            continue;
-        }
-
-        if (amountToAdd >= sourceItem.count)
-        {
-            sourceItem.is_looted = true;
-
-            if (sourceLoot->unlootedCount > 0)
-                --sourceLoot->unlootedCount;
-        }
-        else
-        {
-            sourceItem.count = static_cast<uint8>(
-                sourceItem.count - amountToAdd);
-        }
-    }
-
-    // Apply all successfully collected gold to the selected corpse.
-    mainLoot->gold = totalGold;
-
-    // Remove only rows that were successfully transferred.
-    // Rejected overflow rows remain on their source corpses.
-    for (Creature* creature : processedCreatures)
-    {
-        Loot* loot = &creature->loot;
-
-        CompactTransferredRegularLoot(loot);
-
-        if (!loot->isLooted())
-            continue;
-
-        creature->AllLootRemovedFromCorpse();
-        creature->RemoveDynamicFlag(
-            UNIT_DYNFLAG_LOOTABLE);
-        loot->clear();
-    }
-    
-    // Organize regular loot before sending the window.
-    SortRegularLoot(mainLoot);
-
-    // Send merged loot window
+    // Pull in what the corpses around it hold, then show the one window.
+    MergeNearbyLoot(player, mainCreature, true);
     player->SendLoot(targetGuid, LOOT_CORPSE);
     TrackAoeLootWindow(player, targetGuid);
 

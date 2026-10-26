@@ -53,9 +53,14 @@ enum AoeLootString
 class AOELootPlayer : public PlayerScript
 {
 public:
-    AOELootPlayer() : PlayerScript("AOELootPlayer", { PLAYERHOOK_ON_LOGIN }) {}
+    AOELootPlayer() : PlayerScript("AOELootPlayer", { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_BEFORE_SEND_LOOT }) {}
 
     void OnPlayerLogin(Player* player) override;
+
+    // Playerbots: a bot has no client, so its loot never passes
+    // AOELootServer::CanPacketReceive. Its window is pulled together here,
+    // just before the server sends it.
+    void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot) override;
 };
 
 class AOELootWorld : public WorldScript

@@ -53,6 +53,17 @@ AOELoot.Range = 55.0
 AOELoot.Group = 1
 
 #
+#    AOELoot.Bots
+#        Description: Playerbots loot the corpses around the one they open
+#                     too, so they finish looting a fight in one go. Quest
+#                     items are left to playerbots' own looting.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+#
+
+AOELoot.Bots = 1
+
+#
 #    AOELoot.MailEnable
 #        Description: Mail an item looted from an AoE loot window when it
 #                     does not fit in the bags. Unique items and quest items
