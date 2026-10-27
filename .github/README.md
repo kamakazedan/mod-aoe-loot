@@ -20,9 +20,10 @@ This module enables Area of Effect (AOE) looting functionality for AzerothCore, 
 - **Performance Optimized**: Limits number of corpses processed to maintain server stability
 - **Smart Item Management**:
   - Automatic gold accumulation with overflow protection
-  - Quest items sent directly to inventory
+  - Quest items sent directly to inventory, including ones every group member gets their own of (mod-quest-loot-party)
   - Maximum 15 items per loot window to prevent UI issues
 - **Corpse Management**: Automatically cleans up looted corpses to reduce clutter
+- **Playerbots**: bots AoE loot too, so they finish looting a fight in one go
 
 ## Recent Updates
 
@@ -172,6 +173,7 @@ The module can be controlled through configuration file settings (see Configurat
 | `AOELoot.Group` | Boolean | 1 | Allow AOE loot in groups |
 | `AOELoot.Message` | Boolean | 1 | Show login message |
 | `AOELoot.MailEnable` | Boolean | 0 | Mail looted items that don't fit in the bags (unique items are never mailed) |
+| `AOELoot.Bots` | Boolean | 1 | Playerbots AoE loot too (regular items; quest items are left to playerbots) |
 
 ## Multi-language Support
 

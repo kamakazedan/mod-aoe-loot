@@ -493,6 +493,56 @@ namespace
         std::vector<RegularLootCandidate> regularCandidates;
         std::vector<QuestLootCandidate> questCandidates;
 
+        // A quest item everyone in the group gets their own of (freeforall:
+        // mod-quest-loot-party makes ordinary quest drops so). Each looter has
+        // their own row for it, so this player's row is taken and everyone
+        // else's left alone.
+        struct OwnQuestLootCandidate
+        {
+            Creature* sourceCreature;
+            QuestItem* slot;      // the player's own row on that corpse
+            uint32 itemid;
+            uint32 count;
+        };
+
+        std::vector<OwnQuestLootCandidate> ownQuestCandidates;
+
+        // How many more of `itemid` the player's quests still need, counting
+        // what they carry and what is already on its way to them.
+        auto stillNeededFor = [&](uint32 itemid) -> uint32
+        {
+            uint32 maxNeeded = 0;
+            for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            {
+                uint32 questId = player->GetQuestSlotQuestId(slot);
+                if (!questId)
+                    continue;
+
+                Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+                if (!quest)
+                    continue;
+
+                for (uint8 j = 0; j < QUEST_ITEM_OBJECTIVES_COUNT; ++j)
+                    if (quest->RequiredItemId[j] == itemid && quest->RequiredItemCount[j] > maxNeeded)
+                        maxNeeded = quest->RequiredItemCount[j];
+            }
+            if (maxNeeded == 0)
+                return 0;
+
+            uint32 ownedCount = player->GetItemCount(itemid, true);
+            for (QuestLootCandidate const& pending : questCandidates)
+                if (pending.item.itemid == itemid)
+                    ownedCount += pending.item.count;
+            for (OwnQuestLootCandidate const& pending : ownQuestCandidates)
+                if (pending.itemid == itemid)
+                    ownedCount += pending.count;
+            for (LootItem const& mainQuestItem : mainLoot->quest_items)
+                if (mainQuestItem.itemid == itemid)
+                    ownedCount += mainQuestItem.count;
+
+            return ownedCount >= maxNeeded ? 0 : maxNeeded - ownedCount;
+        };
+
         for (Creature* creature : nearbyCorpses)
         {
 
@@ -637,6 +687,39 @@ namespace
                 questCandidates.push_back(
                     { creature, i, cappedItem });
             }
+
+            if (!questItems)
+                continue;
+
+            // The player's own copy of a quest item everyone gets.
+            if (!loot->GetPlayerQuestItems().count(player->GetGUID()))
+                loot->FillNotNormalLootFor(player);
+
+            auto own = loot->GetPlayerQuestItems().find(player->GetGUID());
+            if (own == loot->GetPlayerQuestItems().end() || !own->second)
+                continue;
+
+            for (QuestItem& row : *own->second)
+            {
+                if (row.is_looted || row.index >= loot->quest_items.size())
+                    continue;
+
+                LootItem const& questItem = loot->quest_items[row.index];
+                if (!questItem.freeforall || questItem.is_looted || questItem.rollWinnerGUID)
+                    continue;
+
+                if (!player->HasQuestForItem(questItem.itemid) ||
+                    !questItem.AllowedForPlayer(player, loot->sourceWorldObjectGUID))
+                    continue;
+
+                uint32 const needed = stillNeededFor(questItem.itemid);
+                if (needed == 0)
+                    continue;
+
+                ownQuestCandidates.push_back(
+                    { creature, &row, questItem.itemid,
+                      std::min(static_cast<uint32>(questItem.count), needed) });
+            }
         }
 
         // Prioritize every regular candidate before consuming rows.
@@ -752,6 +835,22 @@ namespace
                 sourceItem.count = static_cast<uint8>(
                     sourceItem.count - amountToAdd);
             }
+        }
+
+        // The player's own copies: their row is looted, nobody else's.
+        for (OwnQuestLootCandidate const& candidate : ownQuestCandidates)
+        {
+            if (candidate.slot->is_looted || !player->HasQuestForItem(candidate.itemid))
+                continue;
+
+            if (candidate.count == 0 || !player->AddItem(candidate.itemid, candidate.count))
+                continue;
+
+            candidate.slot->is_looted = true;
+
+            Loot* sourceLoot = &candidate.sourceCreature->loot;
+            if (sourceLoot->unlootedCount > 0)
+                --sourceLoot->unlootedCount;
         }
 
         // Apply all successfully collected gold to the selected corpse.
