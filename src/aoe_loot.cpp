@@ -16,6 +16,8 @@
  */
 
 #include "aoe_loot.h"
+#include "GameObject.h"
+#include "Map.h"
 #include "DatabaseEnv.h"
 #include "Item.h"
 #include "ObjectMgr.h"
@@ -30,6 +32,43 @@ namespace
     constexpr uint32 AOE_LOOT_STACK_LIMIT = 200;
 
     bool MailEnabled = false;
+    bool ChestQuestLoot = true;
+
+    // A chest without group loot rules fills its quest items for whoever
+    // opens it first, and for nobody after (Player::SendLoot): a second
+    // player, or the rest of the party, finds it empty and waits for it to
+    // restock or respawn. Here everyone who opens it gets their own, and the
+    // opener's party nearby gets theirs at once, the way a corpse does it. With
+    // mod-quest-loot-party (quest items free for all) that is one each, so one
+    // crate does for the whole party. Bots in the party are left out: they open
+    // a chest themselves when playerbots wants the item.
+    void ShareChestQuestLoot(Player* player, ObjectGuid lootGuid, Loot* loot)
+    {
+        if (!ChestQuestLoot || !sConfigMgr->GetOption<bool>("AOELoot.Enable", true))
+            return;
+        Map* map = player->GetMap();
+        GameObject* go = map ? map->GetGameObject(lootGuid) : nullptr;
+        if (!go || &go->loot != loot || go->GetGoType() != GAMEOBJECT_TYPE_CHEST ||
+            go->GetGOInfo()->chest.groupLootRules || loot->quest_items.empty())
+            return;
+
+        loot->FillNotNormalLootFor(player);   // theirs too, when someone opened it first
+
+        Group* group = player->GetGroup();
+        if (!group)
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == player || !member->IsInWorld() || member->GetMap() != map)
+                continue;
+            WorldSession* session = member->GetSession();
+            if (!session || session->IsSocketClosed())
+                continue;   // a bot
+            if (member->IsAtLootRewardDistance(go))
+                loot->FillNotNormalLootFor(member);
+        }
+    }
 
     // Loot window opened by the module, kept on the player.
     struct AoeLootWindow : public DataMap::Base
@@ -890,6 +929,12 @@ void AOELootPlayer::OnPlayerLogin(Player* player)
 
 void AOELootPlayer::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot)
 {
+    if (player && loot && lootGuid.IsGameObject())
+    {
+        ShareChestQuestLoot(player, lootGuid, loot);
+        return;
+    }
+
     if (!player || !loot || !lootGuid.IsCreatureOrVehicle() || loot->loot_type != LOOT_CORPSE)
         return;
 
@@ -919,6 +964,7 @@ void AOELootPlayer::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, 
 void AOELootWorld::OnAfterConfigLoad(bool /*reload*/)
 {
     MailEnabled = sConfigMgr->GetOption<bool>("AOELoot.MailEnable", false);
+    ChestQuestLoot = sConfigMgr->GetOption<bool>("AOELoot.ChestQuestLoot", true);
 }
 
 bool AOELootServer::CanPacketReceive(WorldSession* session, WorldPacket const& packet)

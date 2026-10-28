@@ -64,6 +64,22 @@ AOELoot.Group = 1
 AOELoot.Bots = 1
 
 #
+#    AOELoot.ChestQuestLoot
+#        Description: A chest with a quest item in it (a crate, a wardrobe, a
+#                     sack) gives everyone who opens it their own, and the
+#                     opener's party nearby theirs at the same time, the way
+#                     a corpse does. Without it, only whoever opens it first
+#                     gets the item, and the next player finds it empty until
+#                     it restocks or respawns. With mod-quest-loot-party that
+#                     is one each, so one chest does for the whole party.
+#                     Bots in the party open chests themselves.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+#
+
+AOELoot.ChestQuestLoot = 1
+
+#
 #    AOELoot.MailEnable
 #        Description: Mail an item looted from an AoE loot window when it
 #                     does not fit in the bags. Unique items and quest items

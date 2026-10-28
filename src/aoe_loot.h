@@ -59,7 +59,8 @@ public:
 
     // Playerbots: a bot has no client, so its loot never passes
     // AOELootServer::CanPacketReceive. Its window is pulled together here,
-    // just before the server sends it.
+    // just before the server sends it. Chests: everyone who opens one, and
+    // the opener's party, gets their own quest items (AOELoot.ChestQuestLoot).
     void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot) override;
 };
 
