@@ -31,6 +31,13 @@ namespace
 {
     constexpr uint32 AOE_LOOT_STACK_LIMIT = 200;
 
+    // AOELoot.* as last loaded (OnAfterConfigLoad, again on a reload): read
+    // once there, not on every loot window.
+    bool Enabled = true;
+    bool LoginMessage = true;
+    bool GroupEnabled = true;
+    bool BotsEnabled = true;
+    float LootRange = 55.0f;   // clamped to 5..100 yards
     bool MailEnabled = false;
     bool ChestQuestLoot = true;
 
@@ -44,7 +51,7 @@ namespace
     // a chest themselves when playerbots wants the item.
     void ShareChestQuestLoot(Player* player, ObjectGuid lootGuid, Loot* loot)
     {
-        if (!ChestQuestLoot || !sConfigMgr->GetOption<bool>("AOELoot.Enable", true))
+        if (!ChestQuestLoot || !Enabled)
             return;
         Map* map = player->GetMap();
         GameObject* go = map ? map->GetGameObject(lootGuid) : nullptr;
@@ -479,19 +486,9 @@ namespace
     {
         ObjectGuid const targetGuid = mainCreature->GetGUID();
 
-        // Get configured loot range
-        float range = sConfigMgr->GetOption<float>("AOELoot.Range", 55.0f);
-
-        // Limit range to reasonable values
-        if (range < 5.0f)
-            range = 5.0f;
-
-        if (range > 100.0f)
-            range = 100.0f;
-
         // Get nearby corpses
         std::list<Creature*> nearbyCorpses;
-        player->GetDeadCreatureListInGrid(nearbyCorpses, range);
+        player->GetDeadCreatureListInGrid(nearbyCorpses, LootRange);
 
         // Remove invalid corpses and main target
         nearbyCorpses.remove_if([&](Creature* c)
@@ -660,63 +657,9 @@ namespace
                     continue;
                 }
 
-                uint32 maxNeeded = 0;
-
-                for (uint8 slot = 0;
-                     slot < MAX_QUEST_LOG_SIZE;
-                     ++slot)
-                {
-                    uint32 questId =
-                        player->GetQuestSlotQuestId(slot);
-
-                    if (!questId)
-                        continue;
-
-                    Quest const* quest =
-                        sObjectMgr->GetQuestTemplate(questId);
-
-                    if (!quest)
-                        continue;
-
-                    for (uint8 j = 0;
-                         j < QUEST_ITEM_OBJECTIVES_COUNT;
-                         ++j)
-                    {
-                        if (quest->RequiredItemId[j] ==
-                                questItem.itemid &&
-                            quest->RequiredItemCount[j] >
-                                maxNeeded)
-                        {
-                            maxNeeded =
-                                quest->RequiredItemCount[j];
-                        }
-                    }
-                }
-
-                if (maxNeeded == 0)
+                uint32 const stillNeeded = stillNeededFor(questItem.itemid);
+                if (stillNeeded == 0)
                     continue;
-
-                uint32 ownedCount =
-                    player->GetItemCount(questItem.itemid, true);
-
-                for (QuestLootCandidate const& pending :
-                     questCandidates)
-                {
-                    if (pending.item.itemid == questItem.itemid)
-                        ownedCount += pending.item.count;
-                }
-
-                for (LootItem const& mainQuestItem :
-                     mainLoot->quest_items)
-                {
-                    if (mainQuestItem.itemid == questItem.itemid)
-                        ownedCount += mainQuestItem.count;
-                }
-
-                if (ownedCount >= maxNeeded)
-                    continue;
-
-                uint32 stillNeeded = maxNeeded - ownedCount;
 
                 LootItem cappedItem = questItem;
                 cappedItem.count = std::min(
@@ -731,7 +674,7 @@ namespace
                 continue;
 
             // The player's own copy of a quest item everyone gets.
-            if (!loot->GetPlayerQuestItems().count(player->GetGUID()))
+            if (!loot->GetPlayerQuestItems().contains(player->GetGUID()))
                 loot->FillNotNormalLootFor(player);
 
             auto own = loot->GetPlayerQuestItems().find(player->GetGUID());
@@ -922,7 +865,7 @@ void AOELootPlayer::OnPlayerLogin(Player* player)
     if (!player)
         return;
 
-    if (sConfigMgr->GetOption<bool>("AOELoot.Enable", true) && sConfigMgr->GetOption<bool>("AOELoot.Message", true))
+    if (Enabled && LoginMessage)
         if (WorldSession* session = player->GetSession())
             ChatHandler(session).PSendModuleSysMessage(MODULE_STRING, AOE_LOGIN_MESSAGE);
 }
@@ -944,11 +887,10 @@ void AOELootPlayer::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, 
     if (!session || !session->IsSocketClosed())
         return;
 
-    if (!sConfigMgr->GetOption<bool>("AOELoot.Enable", true) ||
-        !sConfigMgr->GetOption<bool>("AOELoot.Bots", true))
+    if (!Enabled || !BotsEnabled)
         return;
 
-    if (player->GetGroup() && !sConfigMgr->GetOption<bool>("AOELoot.Group", true))
+    if (player->GetGroup() && !GroupEnabled)
         return;
 
     Creature* mainCreature = player->GetMap()->GetCreature(lootGuid);
@@ -963,6 +905,12 @@ void AOELootPlayer::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, 
 
 void AOELootWorld::OnAfterConfigLoad(bool /*reload*/)
 {
+    Enabled = sConfigMgr->GetOption<bool>("AOELoot.Enable", true);
+    LoginMessage = sConfigMgr->GetOption<bool>("AOELoot.Message", true);
+    GroupEnabled = sConfigMgr->GetOption<bool>("AOELoot.Group", true);
+    BotsEnabled = sConfigMgr->GetOption<bool>("AOELoot.Bots", true);
+    // Limit range to reasonable values
+    LootRange = std::clamp(sConfigMgr->GetOption<float>("AOELoot.Range", 55.0f), 5.0f, 100.0f);
     MailEnabled = sConfigMgr->GetOption<bool>("AOELoot.MailEnable", false);
     ChestQuestLoot = sConfigMgr->GetOption<bool>("AOELoot.ChestQuestLoot", true);
 }
@@ -997,7 +945,7 @@ bool AOELootServer::CanPacketReceive(WorldSession* session, WorldPacket const& p
     ForgetAoeLootWindow(player);
 
     // Check if module is enabled
-    if (!sConfigMgr->GetOption<bool>("AOELoot.Enable", true))
+    if (!Enabled)
         return true;
 
     // Check if player has AOE loot disabled via command
@@ -1007,7 +955,7 @@ bool AOELootServer::CanPacketReceive(WorldSession* session, WorldPacket const& p
         return true;
 
     // Check group settings
-    if (player->GetGroup() && !sConfigMgr->GetOption<bool>("AOELoot.Group", true))
+    if (player->GetGroup() && !GroupEnabled)
         return true;
 
     // Read target GUID from packet
